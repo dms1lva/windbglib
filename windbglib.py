@@ -71,8 +71,27 @@ if pykd.is64bitSystem():
 	arch = 64
 
 TOP_USERLAND = 0x7fffffff if arch == 32 else 0x7FFFFFFFFFFF
-# Utility functions
+PROCESS_VM_OPERATION = 0x0008
+PROCESS_QUERY_INFORMATION = 0x0400
+ERROR_INVALID_PARAMETER = 87
 
+
+# https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-memory_basic_information
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+	_fields_ = [
+		('BaseAddress',         ctypes.c_size_t),    # remote pointer
+		('AllocationBase',      ctypes.c_size_t),    # remote pointer
+		('AllocationProtect',   ctypes.c_uint32),
+		('RegionSize',          ctypes.c_size_t),
+		('State',               ctypes.c_uint32),
+		('Protect',             ctypes.c_uint32),
+		('Type',                ctypes.c_uint32),
+		]
+PMEMORY_BASIC_INFORMATION = ctypes.POINTER(MEMORY_BASIC_INFORMATION)
+
+
+
+# Utility functions
 def getOSVersion():
 	osversions = {}
 	osversions["5.0"] = "2000"
@@ -609,7 +628,6 @@ class Debugger:
 		return vaddr
 
 	def rVirtualAlloc(self, lpAddress, dwSize, flAllocationType, flProtect):
-		PROCESS_VM_OPERATION = 0x0008
 		kernel32 = ctypes.windll.kernel32
 		pid = self.getDebuggedPid()
 		hprocess = kernel32.OpenProcess( PROCESS_VM_OPERATION, False, pid )
@@ -984,7 +1002,7 @@ class Debugger:
 			sehchain.append(sehrecord)
 			nextrecord = nseh
 		return sehchain
-	
+
 	"""
 	Memory
 	"""
@@ -1041,19 +1059,38 @@ class Debugger:
 		return
 
 
+	def VirtualQueryEx(self, hProcess, lpAddress):
+		virtualqueryex = ctypes.windll.kernel32.VirtualQueryEx
+		virtualqueryex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, PMEMORY_BASIC_INFORMATION, ctypes.c_size_t]
+		virtualqueryex.restype  = ctypes.c_size_t
+
+		lpBuffer  = MEMORY_BASIC_INFORMATION()
+		dwLength  = ctypes.sizeof(MEMORY_BASIC_INFORMATION)
+		# pdb.set_trace()
+		success   = virtualqueryex(hProcess, lpAddress, ctypes.byref(lpBuffer), dwLength)
+		if success == 0:
+			raise ctypes.WinError()
+		return lpBuffer
+
+	def virtualQuery(self, address):
+		pid = self.getDebuggedPid()
+		kernel32 = ctypes.windll.kernel32
+		hprocess = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+		return self.VirtualQueryEx(hprocess, address)
+
 	def getMemoryPages(self):
 		if not self.MemoryPages:
-			address_output = pykd.dbgCommand('!address -c:".printf\\"%1 %3 \\\\n\\""')
-			address_output_lines = address_output.split('\n')
-			info_regex = re.compile(r'0x[\da-fA-F]+ 0x[\da-fA-F]+')
-			for memory_page_info in address_output_lines:
-				memory_page_info = memory_page_info.strip()
-				if info_regex.match(memory_page_info):
-					info = memory_page_info.split(' ')
-					starting_address = int(info[0].replace('`', ''), base=16)
-					size = int(info[1].replace('`', ''), base=16)
-					page_obj = wpage(starting_address, size)
-					self.MemoryPages[starting_address] = page_obj
+			current_address = 0
+			while current_address < TOP_USERLAND:
+				try:
+					memory_basic_information = self.virtualQuery(current_address)
+				except WindowsError as error:
+					if error.winerror == ERROR_INVALID_PARAMETER:
+						break
+					raise
+				page_obj = wpage(current_address, memory_basic_information.RegionSize)
+				self.MemoryPages[current_address] = page_obj
+				current_address += memory_basic_information.RegionSize
 		return self.MemoryPages
 
 
